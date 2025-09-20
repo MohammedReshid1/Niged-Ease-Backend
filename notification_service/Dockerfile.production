@@ -1,0 +1,102 @@
+# Production Dockerfile for Notification Service
+FROM python:3.11-slim AS builder
+
+# Build arguments
+ARG BUILD_DATE
+ARG VCS_REF
+
+# Labels for metadata
+LABEL maintainer="Niged Ease Team" \
+      org.label-schema.build-date=$BUILD_DATE \
+      org.label-schema.vcs-ref=$VCS_REF \
+      org.label-schema.name="Niged Ease Notification Service" \
+      org.label-schema.description="Production Docker image for Niged Ease Notification Service" \
+      org.label-schema.version="1.0.0"
+
+# Set build environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install system dependencies in builder stage
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        libpq-dev \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Set work directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir gunicorn[gevent] \
+    && pip install --no-cache-dir redis \
+    && pip install --no-cache-dir celery[redis]
+
+# Production stage
+FROM python:3.11-slim AS production
+
+# Install runtime dependencies only
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+        dumb-init \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Copy Python dependencies from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Set work directory
+WORKDIR /app
+
+# Create necessary directories
+RUN mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
+
+# Copy application code
+COPY --chown=appuser:appuser . .
+
+# Set runtime environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DJANGO_SETTINGS_MODULE=notification_service.settings \
+    PORT=8001
+
+# Expose port
+EXPOSE 8001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8001/health/ || exit 1
+
+# Switch to app user
+USER appuser
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["dumb-init", "--"]
+
+# Default command
+CMD ["gunicorn", "notification_service.wsgi:application", \
+     "--bind", "0.0.0.0:8001", \
+     "--workers", "2", \
+     "--threads", "2", \
+     "--worker-class", "gthread", \
+     "--timeout", "120", \
+     "--max-requests", "1000", \
+     "--access-logfile", "/app/logs/gunicorn-access.log", \
+     "--error-logfile", "/app/logs/gunicorn-error.log", \
+     "--log-level", "info"]
